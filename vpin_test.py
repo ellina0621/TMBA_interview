@@ -17,6 +17,7 @@ from scipy.stats import pearsonr
 from scipy.stats import ttest_1samp
 from arch import arch_model
 import statsmodels.formula.api as smf
+from datetime import time
 
 #資料處理
 df = pd.read_csv("D:/NSYSU FIN/pinpinpinpinpinpin/TXF_R1_1min_data_combined.csv")
@@ -35,9 +36,7 @@ df["minute"] = df["datetime"].dt.minute
 #即使我們不知道任何資訊，我們可以透過統計得出台灣期貨市場在隔夜正報酬後的資訊價值分布情況，我想將其作為權重，
 # 若某段時間的資訊價值高，這段期間變動的價格對我來說就是有意義的，假設開盤五分鐘的資訊價值高，這五分鐘內的盤勢為開高往下走，
 # 我就假設他之後會往下，我就會在某點位放空，等後續回補。
-#那何時要回補平倉? 我會使用另一個指標－資訊不對稱指標vpin，此指標是警告造市商，預測毒性委託的波動性。
-#若vpin開始快速變大，未來波動性提高，MM更改掛單，使流動性會變差。波動大可能可以回補在更好的點位，但流動性差，你不一定吃的到你要的價格
-#因此VPIN也將視為我們管理風險的指標，若VPIN的CDF斜率增加，那我就要反向平倉。
+#那何時要回補平倉? 我會使用另一個指標－資訊不對稱指標OFI，利用掛單的變動，去預測未來市上漲或下跌
 
 df["date"] = df["date"].astype(str)
 df = df[df["date"] >= "2017-06-01"]
@@ -203,8 +202,6 @@ inform_stats = merged_long.groupby("period")["inform_value"].describe()
 print(inform_stats)
 
 ###資訊價值forg乘上price###
-# 確保時間欄位正確
-# 確保 datetime 是 datetime 格式
 overnight_data["datetime"] = pd.to_datetime(overnight_data["datetime"])
 overnight_data["timecode"] = overnight_data["hour"] * 100 + overnight_data["minute"]
 overnight_data["date"] = pd.to_datetime(overnight_data["date"])
@@ -226,7 +223,6 @@ pt1_df["Pt_label"] = pt1_df["timecode"].map(timecode_to_col)
 
 pt1_wide = pt1_df.pivot(index="date", columns="Pt_label", values="Close").reset_index()
 
-# 1️⃣ period → 對應 column 名稱
 period_to_col = {
     "08:46-09:00": "Pt_0846_0900",
     "09:01-09:10": "Pt_0901_0910",
@@ -236,17 +232,265 @@ period_to_col = {
 }
 merged_long["pt_col"] = merged_long["period"].map(period_to_col)
 
-# 2️⃣ 合併價格表
 merged_long = merged_long.merge(pt1_wide, on="date", how="left")
 
-# 3️⃣ 用 apply 抓出該列對應的價格
 merged_long["Pt-1"] = merged_long.apply(lambda row: row[row["pt_col"]], axis=1)
 
-# 4️⃣ 刪除中介欄位
 merged_long = merged_long.drop(columns=["pt_col"])
 
 merged_long['inform_price'] = merged_long['Pt-1'] * merged_long['inform_value']
 #print(merged_long.head())
 ##統計##
 inform_stats = merged_long.groupby("period")["inform_price"].describe()
-print(inform_stats)
+print(inform_stats) #期貨開盤~現貨開盤前 & 現貨收盤前的資訊價值較佳
+
+
+###基礎設定###
+#單邊成本：$131(fee+tax)
+#滑價成本：1tick
+#本金：$1,000,000
+#1 tick價值：$200
+#只選擇當天有隔夜正報酬的日期trade
+
+###IMPORT 2025/08逐筆資料###
+from data import combine_data
+combined_data = combine_data.copy()
+combined_data = combined_data.sort_values(['date','time']).reset_index(drop=True)
+combined_data['Price'] = pd.to_numeric(combined_data['Price'], errors='coerce')
+
+combined_data["time"] = pd.to_datetime(combined_data["time"], format="%H:%M:%S")
+combined_data["hour"] = combined_data["time"].dt.hour
+combined_data["minute"] = combined_data["time"].dt.minute
+combined_data["second"] = combined_data["time"].dt.second
+combined_data = combined_data.drop(columns=["time"])
+combined_data = combined_data.dropna(how="all").reset_index(drop=True)
+
+#####################建立OBI###################################
+ofi_trade = combined_data.copy()
+ofi_trade = ofi_trade.sort_values(["date","hour","minute","second"]).reset_index(drop=True)
+
+ofi_trade["Pb"] = np.where(ofi_trade["Type"]=="BID", ofi_trade["Price"], np.nan)
+ofi_trade["Qb"] = np.where(ofi_trade["Type"]=="BID", ofi_trade["Size"] , np.nan)
+ofi_trade["Pa"] = np.where(ofi_trade["Type"]=="ASK", ofi_trade["Price"], np.nan)
+ofi_trade["Qa"] = np.where(ofi_trade["Type"]=="ASK", ofi_trade["Size"] , np.nan)
+
+
+ofi_trade["bid_price_prev"] = ofi_trade["Pb"].replace(0, np.nan).ffill().shift(1)
+ofi_trade["bid_size_prev"]  = ofi_trade["Qb"].replace(0, np.nan).ffill().shift(1)
+ofi_trade["ask_price_prev"] = ofi_trade["Pa"].replace(0, np.nan).ffill().shift(1)
+ofi_trade["ask_size_prev"]  = ofi_trade["Qa"].replace(0, np.nan).ffill().shift(1)
+print(ofi_trade)
+
+cols = ["Pb","Qb","Pa","Qa",
+        "bid_price_prev","bid_size_prev",
+        "ask_price_prev","ask_size_prev"]
+
+ofi_trade[cols] = ofi_trade[cols].fillna(0).astype(float)
+
+ofi_trade["e_n"] = 0.0
+ofi_trade.loc[(ofi_trade["Pb"] != 0) & (ofi_trade["Pb"] >= ofi_trade["bid_price_prev"]),
+              "e_n"] += ofi_trade["Qb"]
+
+ofi_trade.loc[(ofi_trade["Pb"] != 0) & (ofi_trade["Pb"] <= ofi_trade["bid_price_prev"]),
+              "e_n"] -= ofi_trade["bid_size_prev"]
+
+ofi_trade.loc[(ofi_trade["Pa"] != 0) & (ofi_trade["Pa"] <= ofi_trade["ask_price_prev"]),
+              "e_n"] -= ofi_trade["Qa"]
+
+ofi_trade.loc[(ofi_trade["Pa"] != 0) & (ofi_trade["Pa"] >= ofi_trade["ask_price_prev"]),
+              "e_n"] += ofi_trade["ask_size_prev"]
+ofi_per_min = (
+    ofi_trade
+    .groupby(["date", "hour", "minute"], as_index=False)["e_n"]
+    .sum()
+    .rename(columns={"e_n": "OFI"})
+)
+
+print(ofi_per_min.head())
+ofi_per_min.rename(columns={"e_n": "OFI"}, inplace=True)
+
+#############實際回測#############
+#篩出隔夜正報酬#
+daily_open_close = (
+    combined_data.sort_values(['date', 'hour', 'minute', 'second'])
+    .groupby("date")
+    .agg(Open=('Price', 'first'), Close=('Price', 'last'))
+    .reset_index()
+)
+
+daily_open_close["Prev_Close"] = daily_open_close["Close"].shift(1)
+
+daily_open_close["overnight_positive"] = daily_open_close["Open"] > daily_open_close["Prev_Close"]
+
+overnight_positive_df = daily_open_close[daily_open_close["overnight_positive"] == True].copy()
+
+#print(overnight_positive_df[["date", "Prev_Close", "Open", "Close"]])
+
+#篩選DATA#
+overnight_dates = overnight_positive_df["date"].unique()
+
+start_time = time(8, 45, 0)
+end_time = time(9, 0, 0)
+
+ofi_trade = ofi_trade.dropna(subset=["hour", "minute", "second"])
+ofi_trade["hour"] = ofi_trade["hour"].astype(int)
+ofi_trade["minute"] = ofi_trade["minute"].astype(int)
+ofi_trade["second"] = ofi_trade["second"].astype(int)
+
+ofi_trade["dt_time"] = ofi_trade.apply(
+    lambda row: time(row["hour"], row["minute"], row["second"]), axis=1
+)
+
+overnight_trade_data = ofi_trade[
+    (ofi_trade["date"].isin(overnight_dates)) &
+    (ofi_trade["dt_time"] >= start_time) &
+    (ofi_trade["dt_time"] <= end_time)
+].copy()
+
+overnight_trade_data.drop(columns=["dt_time"], inplace=True)
+print(overnight_trade_data.head())
+
+
+##加入訊號##
+# 每天第二筆成交當作放空點（entry）
+entry_trades = (
+    overnight_trade_data
+    .sort_values(["date", "hour", "minute", "second"])
+    .groupby("date")
+    .nth(1) 
+    .reset_index()
+    .rename(columns={"Price": "entry_price"})
+)
+
+last_trade_per_min = (
+    overnight_trade_data
+    .sort_values(["date", "hour", "minute", "second"])
+    .groupby(["date", "hour", "minute"])
+    .last()
+    .reset_index()
+)
+
+ofi_merge = pd.merge(last_trade_per_min, ofi_per_min, on=["date", "hour", "minute"], how="left")
+
+ofi_merge = ofi_merge[["date", "hour", "minute", "second", "Price", "OFI"]].copy()
+ofi_merge.rename(columns={"Price": "exit_price"}, inplace=True)
+
+ofi_merge = pd.merge(ofi_merge, entry_trades[["date", "entry_price"]], on="date", how="left")
+
+ofi_merge["return"] = ofi_merge["exit_price"] - ofi_merge["entry_price"]
+
+train_data = ofi_merge.dropna(subset=["OFI", "return"])[["date", "OFI", "return"]].copy()
+
+
+###XGBOOST###
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_squared_error
+import pandas as pd
+
+# 確保日期格式正確
+train_data["date"] = pd.to_datetime(train_data["date"])
+
+# 拿到所有有資料的交易日
+all_dates = sorted(train_data["date"].unique())
+results = []
+
+# 滾動回測：從第 N 天起，做 3:1 rolling 分割
+min_obs = 4  # 至少要 4 天才能切成 3:1
+for i in range(min_obs, len(all_dates)):
+    # 當天作為測試日
+    test_date = all_dates[i]
+
+    # 前面那些天當作訓練（3:1 比例）
+    history_dates = all_dates[:i]
+    n_train = int(len(history_dates) * 0.75)
+    train_dates = history_dates[:n_train]
+    
+   
+    train_df = train_data[train_data["date"].isin(train_dates)]
+    test_df = train_data[train_data["date"] == test_date]
+
+    if train_df.empty or test_df.empty:
+        continue
+
+    X_train = train_df[["OFI"]]
+    y_train = train_df["return"]
+
+    X_test = test_df[["OFI"]]
+    y_test = test_df["return"]
+
+    model = XGBRegressor()
+    model.fit(X_train, y_train)
+
+    y_pred = model.predict(X_test)
+
+    temp_result = test_df.copy()
+    temp_result["predicted_return"] = y_pred
+    results.append(temp_result)
+
+rolling_prediction_df = pd.concat(results, ignore_index=True)
+
+#TEST不太準
+plt.figure(figsize=(8,6))
+plt.scatter(rolling_prediction_df["OFI"], rolling_prediction_df["return"], label="Actual Return", alpha=0.6)
+plt.scatter(rolling_prediction_df["OFI"], rolling_prediction_df["predicted_return"], label="Predicted Return", alpha=0.6)
+plt.axhline(0, linestyle="--", color="gray")
+plt.xlabel("OFI")
+plt.ylabel("Return")
+plt.title("Rolling Predicted vs Actual Return")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+###實際再測一次###
+tick_size = 1 
+
+results = []
+
+for d, df_day in overnight_trade_data.groupby("date"):
+    # 找到當天 entry （第 2 筆成交）
+    if len(df_day) < 2:
+        continue
+    entry_price = df_day.iloc[1]["Price"]
+
+    ofi_day = ofi_per_min[ofi_per_min["date"] == d].sort_values(["hour","minute"])
+
+    # 找出 OFI > 50 的第一個時間點
+    exit_time = None
+    for _, row in ofi_day.iterrows():
+        if row["OFI"] > -50:
+            # OFI 出來後，取下一分鐘的第一筆成交
+            exit_hour = row["hour"]
+            exit_min = row["minute"] + 1
+            if exit_min == 60:
+                exit_hour += 1
+                exit_min = 0
+            df_exit_min = df_day[(df_day["hour"] == exit_hour) & (df_day["minute"] == exit_min)]
+            if not df_exit_min.empty:
+                exit_price = df_exit_min.iloc[0]["Price"]
+                exit_time = (exit_hour, exit_min)
+            break
+
+    if exit_time is None:
+        continue
+
+    pnl_ticks = (entry_price - exit_price) / tick_size
+
+    results.append({
+        "date": d,
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "exit_time": exit_time,
+        "PnL_ticks": pnl_ticks
+    })
+
+results_df = pd.DataFrame(results)
+results_df["PnL_TWD"] = (results_df["PnL_ticks"] * 200)-131-200 #1tick滑價 + 手續費 + 稅
+results_df["Total_PnL_TWD"] = results_df["PnL_TWD"].cumsum()
+
+print(results_df)
+
+##可以改進的地方
+# 1.想加入機器學習法，找到較佳OFI參數與持有時間
+# 2.因為八月的行情都很好，都在後半段偏高檔震盪，因此我們可以看到圖片中ofi無論正或負，幾乎都是正報酬
+# 3.延續第二個問題，認為如果有夜盤資料，確認夜盤走勢，看兩者之間是否有相關性，或許可以適時使用此策略獲利，而不是有隔夜正報酬就認為一定會反轉
