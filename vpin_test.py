@@ -385,7 +385,6 @@ train_data = ofi_merge.dropna(subset=["OFI", "return"])[["date", "OFI", "return"
 ###XGBOOST###
 from xgboost import XGBRegressor
 from sklearn.metrics import mean_squared_error
-import pandas as pd
 
 train_data["date"] = pd.to_datetime(train_data["date"])
 
@@ -395,7 +394,7 @@ results = []
 # 滾動回測： 3:1 rolling 
 min_obs = 4  # 至少要 4 天才能切成 3:1
 for i in range(min_obs, len(all_dates)):
-    # 當天作為測試日
+   
     test_date = all_dates[i]
 
     # 前面那些天當作訓練（3:1 比例）
