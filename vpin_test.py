@@ -448,7 +448,7 @@ tick_size = 1
 results = []
 
 for d, df_day in overnight_trade_data.groupby("date"):
-    # 找到當天 entry （第 2 筆成交）
+    # 第 2 筆成交
     if len(df_day) < 2:
         continue
     entry_price = df_day.iloc[1]["Price"]
