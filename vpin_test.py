@@ -387,14 +387,12 @@ from xgboost import XGBRegressor
 from sklearn.metrics import mean_squared_error
 import pandas as pd
 
-# 確保日期格式正確
 train_data["date"] = pd.to_datetime(train_data["date"])
 
-# 拿到所有有資料的交易日
 all_dates = sorted(train_data["date"].unique())
 results = []
 
-# 滾動回測：從第 N 天起，做 3:1 rolling 分割
+# 滾動回測： 3:1 rolling 
 min_obs = 4  # 至少要 4 天才能切成 3:1
 for i in range(min_obs, len(all_dates)):
     # 當天作為測試日
