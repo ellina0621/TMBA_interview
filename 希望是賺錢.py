@@ -18,7 +18,7 @@ from scipy.stats import ttest_1samp
 from arch import arch_model
 import statsmodels.formula.api as smf
 from datetime import time
-
+import random
 #資料處理
 df = pd.read_csv("D:/NSYSU FIN/pinpinpinpinpinpin/TXF_R1_1min_data_combined.csv")
 
@@ -306,5 +306,274 @@ ofi_per_min = (
     .rename(columns={"e_n": "OFI"})
 )
 
-print(ofi_per_min.head())
+
 ofi_per_min.rename(columns={"e_n": "OFI"}, inplace=True)
+
+print(ofi_per_min.head())
+
+
+####回測####
+trade_tape = combined_data[combined_data["Type"]=="TRADE"].copy()
+trade_tape["date"] = pd.to_datetime(trade_tape["date"])
+trade_tape["dt"]   = pd.to_datetime(
+    trade_tape["date"].dt.strftime("%Y-%m-%d") + " " +
+    trade_tape["hour"].astype(str)+":"+
+    trade_tape["minute"].astype(str)+":"+
+    trade_tape["second"].astype(str)
+)
+trade_tape = trade_tape.sort_values("dt").reset_index(drop=True)
+trade_tape = trade_tape[["dt","Price","Size"]]  
+
+import pandas as pd
+import numpy as np
+import random
+
+# ===================== 1) 只在時間窗產訊號 =====================
+def make_signals_window(ofi_min, long_thres, short_thres,
+                        date_start, date_end,
+                        start_h=8, start_m=45, end_h=9, end_m=0):
+    df = ofi_min.copy()
+
+    # 統一時間欄位
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    df["dt_min"] = (pd.to_datetime(df["date"].astype(str))
+                    + pd.to_timedelta(df["hour"].astype(int),   unit="h")
+                    + pd.to_timedelta(df["minute"].astype(int), unit="m"))
+
+    # 日期 + 時段過濾
+    d0 = pd.to_datetime(date_start).date()
+    d1 = pd.to_datetime(date_end).date()
+    df = df[(df["date"]>=d0) & (df["date"]<=d1)].copy()
+
+    from datetime import time as _time
+    t0 = _time(start_h, start_m)
+    t1 = _time(end_h,   end_m)
+    df["t_in_day"] = df["dt_min"].dt.time
+    df = df[(df["t_in_day"]>=t0) & (df["t_in_day"]<=t1)].copy()
+
+    # 訊號（OFI > L 做多；OFI < S 做空）
+    df["signal"] = 0
+    df.loc[df["OFI"] >  long_thres, "signal"] = 1
+    df.loc[df["OFI"] <  short_thres,"signal"] = -1
+
+    sig = df.loc[df["signal"]!=0, ["dt_min","signal"]].sort_values("dt_min").reset_index(drop=True)
+    return sig
+
+# ===================== 2) 回測（單一倉位 + time-stop） =====================
+def backtest_once_window(trade_tape, signals,
+                         tp_ticks=20, sl_ticks=15,
+                         tick_size=1.0, tick_value=200,
+                         fee_one_side=131, slippage_ticks=1,
+                         end_h=9, end_m=0):
+    """
+    進場=訊號後第一筆 TRADE；停利/停損/到 end_h:end_m 強制平；單一倉位。
+    """
+    from datetime import time as _time
+
+    pos = 0
+    entry_px = entry_t = None
+    round_cost = 2 * fee_one_side
+    slippage_cost = slippage_ticks * tick_value
+    rec = []
+
+    T = trade_tape.sort_values("dt").reset_index(drop=True)
+    t_idx = 0
+
+    for _, s in signals.iterrows():
+        if pos != 0:
+            continue
+
+        sig_t = s["dt_min"]
+        side  = s["signal"]
+
+        # 訊號後第一筆 TRADE 進場
+        while t_idx < len(T) and T.iloc[t_idx]["dt"] < sig_t:
+            t_idx += 1
+        if t_idx >= len(T):
+            break
+
+        entry_t = T.iloc[t_idx]["dt"]
+        entry_px= float(T.iloc[t_idx]["Price"])
+        pos = side
+
+        # time-stop 門檻（當天 end_h:end_m）
+        day_end = pd.Timestamp(entry_t.date()) + pd.Timedelta(hours=end_h, minutes=end_m)
+
+        tp_px = entry_px + (tp_ticks * tick_size) * (1 if pos==1 else -1)
+        sl_px = entry_px - (sl_ticks * tick_size) * (1 if pos==1 else -1)
+
+        j = t_idx + 1
+        exit_t = exit_px = None
+        while j < len(T):
+            px = float(T.iloc[j]["Price"])
+            t  = T.iloc[j]["dt"]
+
+            # 觸價平倉
+            if pos==1 and (px >= tp_px or px <= sl_px):
+                exit_t, exit_px = t, px
+                break
+            if pos==-1 and (px <= tp_px or px >= sl_px):
+                exit_t, exit_px = t, px
+                break
+
+            # 達到 time-stop → 用 >= 門檻的第一筆 TRADE 出場
+            if t >= day_end:
+                exit_t, exit_px = t, px
+                break
+            j += 1
+
+        if exit_t is None:
+            break  # 後面沒有成交，無法平倉
+
+        pnl_ticks = (exit_px - entry_px) if pos==1 else (entry_px - exit_px)
+        pnl_money = pnl_ticks * tick_value - round_cost - slippage_cost
+
+        rec.append({
+            "entry_time": entry_t, "entry_px": entry_px, "side": pos,
+            "exit_time": exit_t,  "exit_px": exit_px,
+            "pnl_ticks": pnl_ticks, "pnl_money": pnl_money
+        })
+
+        pos = 0
+        t_idx = j + 1
+        if t_idx >= len(T):
+            break
+
+    recdf = pd.DataFrame(rec)
+    if recdf.empty:
+        return 0.0, 0, 0.0, recdf
+    return recdf["pnl_money"].sum(), len(recdf), (recdf["pnl_money"]>0).mean(), recdf
+
+# ===================== 3) 樣本內 Random Search =====================
+def random_search_IS(ofi_min, trade_tape,
+                     date_start, date_end,
+                     n_iter=200,
+                     long_range=(50, 400), short_range=(-400, -50),
+                     tp_range=(5, 40), sl_range=(5, 40),
+                     start_h=8, start_m=45, end_h=9, end_m=0,
+                     seed=42):
+    random.seed(seed)
+    trials = []
+    for _ in range(n_iter):
+        L  = random.uniform(*long_range)
+        S  = random.uniform(*short_range)
+        TP = int(random.uniform(*tp_range))
+        SL = int(random.uniform(*sl_range))
+
+        sig = make_signals_window(ofi_min, L, S,
+                                  date_start=date_start, date_end=date_end,
+                                  start_h=start_h, start_m=start_m,
+                                  end_h=end_h, end_m=end_m)
+
+        pnl, n_tr, wr, _ = backtest_once_window(
+            trade_tape, sig,
+            tp_ticks=TP, sl_ticks=SL,
+            end_h=end_h, end_m=end_m
+        )
+
+        trials.append({"L": L, "S": S, "TP": TP, "SL": SL,
+                       "PnL": pnl, "Trades": n_tr, "WinRate": wr})
+
+    return (pd.DataFrame(trials)
+              .sort_values(["PnL", "Trades"], ascending=[False, False])
+              .reset_index(drop=True))
+
+# ===================== 4) Walk-Forward（每日移動） =====================
+def walk_forward_daily(ofi_min, trade_tape,
+                       train_start="2025-08-01",
+                       test_start="2025-08-13",
+                       test_end="2025-08-31",
+                       mode="expanding",           # "expanding" 或 "rolling"
+                       lookback_days=10,           # rolling 時使用
+                       n_iter=300,
+                       long_range=(50,400), short_range=(-400,-50),
+                       tp_range=(5,40), sl_range=(5,40),
+                       start_h=8, start_m=45, end_h=9, end_m=0,
+                       seed=42):
+    """
+    對每個測試日 t：用 [train_start, t-1] (expanding) 或 [t-lookback+1, t-1] (rolling) 做 Random Search，
+    取最佳參數，並在 t 當天的時間窗回測。
+    回傳： (summary_df, all_trades_df)
+    """
+    random.seed(seed)
+
+    # 可交易日期（兩個資料都要有）
+    trade_days = pd.to_datetime(trade_tape["dt"]).dt.date.unique()
+    ofi_days   = pd.to_datetime(ofi_min["date"]).astype("datetime64[ns]").dt.date.unique()
+    valid_days = sorted(list(set(trade_days).intersection(set(ofi_days))))
+
+    test_days = pd.date_range(test_start, test_end, freq="D").date
+    test_days = [d for d in test_days if d in valid_days]
+
+    daily_rows, trades_all = [], []
+
+    for tday in test_days:
+        train_end = pd.Timestamp(tday) - pd.Timedelta(days=1)
+        if mode == "expanding":
+            cur_train_start = pd.Timestamp(train_start)
+        else:  # rolling 視窗
+            cur_train_start = max(pd.Timestamp(train_start),
+                                  train_end - pd.Timedelta(days=lookback_days-1))
+
+        if cur_train_start.date() >= train_end.date():
+            continue  # 沒有訓練天數
+
+        # 1) 樣本內搜尋（時間窗一致）
+        res = random_search_IS(
+            ofi_min, trade_tape,
+            date_start=cur_train_start.date().isoformat(),
+            date_end=train_end.date().isoformat(),
+            n_iter=n_iter,
+            long_range=long_range, short_range=short_range,
+            tp_range=tp_range, sl_range=sl_range,
+            start_h=start_h, start_m=start_m, end_h=end_h, end_m=end_m,
+            seed=seed
+        )
+        if res.empty:
+            continue
+        best = res.iloc[0]
+
+        # 2) 當天訊號
+        sig = make_signals_window(
+            ofi_min, best["L"], best["S"],
+            date_start=tday, date_end=tday,
+            start_h=start_h, start_m=start_m, end_h=end_h, end_m=end_m
+        )
+
+        # 3) 當天回測
+        pnl, n_tr, wr, trades = backtest_once_window(
+            trade_tape, sig,
+            tp_ticks=int(best["TP"]), sl_ticks=int(best["SL"]),
+            end_h=end_h, end_m=end_m
+        )
+
+        daily_rows.append({
+            "date": pd.to_datetime(tday),
+            "L": best["L"], "S": best["S"], "TP": int(best["TP"]), "SL": int(best["SL"]),
+            "PnL": pnl, "Trades": n_tr, "WinRate": wr
+        })
+        if not trades.empty:
+            trades["test_date"] = pd.to_datetime(tday)
+            trades_all.append(trades)
+
+    summary = pd.DataFrame(daily_rows).sort_values("date").reset_index(drop=True)
+    if not summary.empty:
+        summary["cumPnL"] = summary["PnL"].cumsum()
+    trades_all = pd.concat(trades_all, ignore_index=True) if len(trades_all)>0 else pd.DataFrame()
+    return summary, trades_all
+
+# 只做 08:45–09:00
+wf_sum, wf_trades = walk_forward_daily(
+    ofi_per_min, trade_tape,
+    train_start="2025-08-01",
+    test_start="2025-08-13",
+    test_end="2025-08-31",
+    mode="expanding",          # 8/14 用 8/1~8/13；8/15 用 8/1~8/14；以此類推
+    n_iter=300,
+    start_h=8, start_m=45, end_h=9, end_m=0
+)
+
+print(wf_sum)
+print("樣本外總PnL：", wf_sum["PnL"].sum())
+# wf_sum.to_csv("wf_daily_summary.csv", index=False)
+# wf_trades.to_csv("wf_all_trades.csv", index=False)
